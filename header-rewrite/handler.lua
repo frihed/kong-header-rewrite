@@ -6,6 +6,23 @@ local HeaderRewriteHandler = BasePlugin:extend()
 HeaderRewriteHandler.VERSION  = "1.0.0"
 HeaderRewriteHandler.PRIORITY = 2900
 
+local function load_from_db(key)
+    local entity, err = kong.db.header_rewrite:select_by_match(key)
+    if err then
+        kong.log.err(err)
+    end
+    return entity
+end
+
+local function set_entity_cache(entity)
+    kong.log("add header_rewrite cache, match: " .. entity.match)  -- default level is notice
+    local cache_key = kong.db.header_rewrite:cache_key(entity.match)
+    local ok, err = kong.cache:safe_set(cache_key, entity);
+    if not ok then
+        kong.log.err(err)
+    end
+end
+
 local function get_cache(key)
     local cache_key = kong.db.header_rewrite:cache_key(key)
     return kong.cache:probe(cache_key)
@@ -26,7 +43,7 @@ local function execute(config)
     if header then
         local entity = rewrite_value(header)
         if entity and entity.rewrite ~= ngx.req.get_headers()[config.rewrite] then 
-            kong.log.info("rewrite to " .. entity.rewrite)
+            kong.log("rewrite to " .. entity.rewrite)
             ngx.req.set_header(config.rewrite, entity.rewrite)
         end
     end
@@ -44,18 +61,28 @@ function HeaderRewriteHandler:init_worker()
         kong.log.err("load cache error" .. err)
       return nil, err
     end
-    -- listen to CRUD operation, note: only Create 
+    -- listen to CRUD operation, note: Create and Update
     kong.worker_events.register(function(data)
         if data.operation == "create" or data.operation == "update" then
-            local key = data.entity.match
-            kong.log("add header_rewrite cache, match: " .. key)
-            local cache_key = kong.db.header_rewrite:cache_key(key)
-            local ok, err = kong.cache:safe_set(cache_key, data.entity);
-            if err then
-                kong.log.err(err)
+            set_entity_cache(data.entity)
+            kong.log("broadcasting header_rewrite_update for key: '", key, "'")
+            local ok, err = kong.cluster_events:broadcast("header_rewrite_update", key)
+            if not ok then
+                kong.log.err("header_rewrite failed to broadcast cached entity : ", err)
             end
         end
     end, "crud", "header_rewrite")
+
+    local ok, err = kong.cluster_events:subscribe("header_rewrite_update", function(key)
+        kong.log.notice("received header_rewrite_update event from cluster for key: '", key, "'")
+        local entity = load_from_db(key)
+        if entity then
+            set_entity_cache(entity)
+        end
+    end)
+    if not ok then
+        kong.log.err("failed to subscribe to header_rewrite_update cluster events ", err)
+    end
 end
 
 
